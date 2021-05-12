@@ -1,11 +1,9 @@
 """Define functions to create the triplet loss with online triplet mining."""
 
-import tensorflow as tf
+import torch
 import numpy as np
-from tensorflow_addons.utils.keras_utils import LossFunctionWrapper
 from typeguard import typechecked
 from typing import Optional, Union, Callable
-from tensorflow_addons.utils.types import FloatTensorLike, TensorLike
 
 
 def _pairwise_distances(embeddings, squared=False):
@@ -19,28 +17,29 @@ def _pairwise_distances(embeddings, squared=False):
     """
     # Get the dot product between all embeddings
     # shape (batch_size, batch_size)
-    dot_product = tf.matmul(embeddings, tf.transpose(embeddings))
+    dot_product = torch.matmul(embeddings, torch.transpose(embeddings))
 
     # Get squared L2 norm for each embedding. We can just take the diagonal of `dot_product`.
     # This also provides more numerical stability (the diagonal of the result will be exactly 0).
     # shape (batch_size,)
-    square_norm = tf.linalg.diag_part(dot_product)
+    square_norm = torch.diagonal(dot_product)
 
     # Compute the pairwise distance matrix as we have:
     # ||a - b||^2 = ||a||^2  - 2 <a, b> + ||b||^2
     # shape (batch_size, batch_size)
-    distances = tf.expand_dims(square_norm, 1) - 2.0 * dot_product + tf.expand_dims(square_norm, 0)
+    distances = torch.unsqueeze(square_norm, 1) - 2.0 * dot_product + torch.unsqueeze(square_norm, 0)
 
     # Because of computation errors, some distances might be negative so we put everything >= 0.0
-    distances = tf.maximum(distances, 0.0)
+    distances = torch.maximum(distances, 0.0)
 
     if not squared:
         # Because the gradient of sqrt is infinite when distances == 0.0 (ex: on the diagonal)
         # we need to add a small epsilon where distances == 0.0
-        mask = tf.cast(tf.equal(distances, 0.0), dtype=tf.float32)
+        mask = torch.eq(distances, 0.0)
+        mask = mask.type(torch.float32)
         distances = distances + mask * 1e-16
 
-        distances = tf.sqrt(distances)
+        distances = torch.sqrt(distances)
 
         # Correct the epsilon added: set the distances on the mask to be exactly 0.0
         distances = distances * (1.0 - mask)
@@ -51,20 +50,20 @@ def _pairwise_distances(embeddings, squared=False):
 def _get_anchor_positive_triplet_mask(labels):
     """Return a 2D mask where mask[a, p] is True iff a and p are distinct and have same label.
     Args:
-        labels: tf.int32 `Tensor` with shape [batch_size]
+        labels: torch.int32 `Tensor` with shape [batch_size]
     Returns:
-        mask: tf.bool `Tensor` with shape [batch_size, batch_size]
+        mask: torch.bool `Tensor` with shape [batch_size, batch_size]
     """
     # Check that i and j are distinct
-    indices_equal = tf.cast(tf.eye(tf.shape(labels)[0]), tf.bool)
-    indices_not_equal = tf.logical_not(indices_equal)
+    indices_equal = torch.eye(labels.shape[0]).type(torch.bool)
+    indices_not_equal = torch.logical_not(indices_equal)
 
     # Check if labels[i] == labels[j]
     # Uses broadcasting where the 1st argument has shape (1, batch_size) and the 2nd (batch_size, 1)
-    labels_equal = tf.equal(tf.expand_dims(labels, 0), tf.expand_dims(labels, 1))
+    labels_equal = torch.eq(torch.unsqueeze(labels,0), torch.unsqueeze(labels,1))
 
     # Combine the two masks
-    mask = tf.logical_and(indices_not_equal, labels_equal)
+    mask = torch.logical_and(indices_not_equal, labels_equal)
 
     return mask
 
@@ -72,15 +71,15 @@ def _get_anchor_positive_triplet_mask(labels):
 def _get_anchor_negative_triplet_mask(labels):
     """Return a 2D mask where mask[a, n] is True iff a and n have distinct labels.
     Args:
-        labels: tf.int32 `Tensor` with shape [batch_size]
+        labels: torch.int32 `Tensor` with shape [batch_size]
     Returns:
-        mask: tf.bool `Tensor` with shape [batch_size, batch_size]
+        mask: torch.bool `Tensor` with shape [batch_size, batch_size]
     """
     # Check if labels[i] != labels[k]
     # Uses broadcasting where the 1st argument has shape (1, batch_size) and the 2nd (batch_size, 1)
-    labels_equal = tf.equal(tf.expand_dims(labels, 0), tf.expand_dims(labels, 1))
+    labels_equal = torch.eq(torch.unsqueeze(labels,0), torch.unsqueeze(labels,1))
 
-    mask = tf.logical_not(labels_equal)
+    mask = torch.logical_not(labels_equal)
 
     return mask
 
@@ -91,27 +90,27 @@ def _get_triplet_mask(labels):
         - i, j, k are distinct
         - labels[i] == labels[j] and labels[i] != labels[k]
     Args:
-        labels: tf.int32 `Tensor` with shape [batch_size]
+        labels: torch.int32 `Tensor` with shape [batch_size]
     """
     # Check that i, j and k are distinct
-    indices_equal = tf.cast(tf.eye(tf.shape(labels)[0]), tf.bool)
-    indices_not_equal = tf.logical_not(indices_equal)
-    i_not_equal_j = tf.expand_dims(indices_not_equal, 2)
-    i_not_equal_k = tf.expand_dims(indices_not_equal, 1)
-    j_not_equal_k = tf.expand_dims(indices_not_equal, 0)
+    indices_equal = torch.eye(labels.shape[0]).type(torch.bool)
+    indices_not_equal = torch.logical_not(indices_equal)
+    i_not_equal_j = torch.unsqueeze(indices_not_equal, 2)
+    i_not_equal_k = torch.unsqueeze(indices_not_equal, 1)
+    j_not_equal_k = torch.unsqueeze(indices_not_equal, 0)
 
-    distinct_indices = tf.logical_and(tf.logical_and(i_not_equal_j, i_not_equal_k), j_not_equal_k)
+    distinct_indices = torch.logical_and(torch.logical_and(i_not_equal_j, i_not_equal_k), j_not_equal_k)
 
 
     # Check if labels[i] == labels[j] and labels[i] != labels[k]
-    label_equal = tf.equal(tf.expand_dims(labels, 0), tf.expand_dims(labels, 1))
-    i_equal_j = tf.expand_dims(label_equal, 2)
-    i_equal_k = tf.expand_dims(label_equal, 1)
+    label_equal = torch.eq(torch.unsqueeze(labels, 0), torch.unsqueeze(labels, 1))
+    i_equal_j = torch.unsqueeze(label_equal, 2)
+    i_equal_k = torch.unsqueeze(label_equal, 1)
 
-    valid_labels = tf.logical_and(i_equal_j, tf.logical_not(i_equal_k))
+    valid_labels = torch.logical_and(i_equal_j, torch.logical_not(i_equal_k))
 
     # Combine the two masks
-    mask = tf.logical_and(distinct_indices, valid_labels)
+    mask = torch.logical_and(distinct_indices, valid_labels)
 
     return mask
 
@@ -131,45 +130,45 @@ def adapted_triplet_loss(labels, embeddings, lambda_=2.0, margin=1, soft=False, 
     """
     
     # Get the pairwise distance matrix
-    labels = tf.squeeze(labels)
-    embeddings = tf.squeeze(embeddings)
+    labels = torch.squeeze(labels)
+    embeddings = torch.squeeze(embeddings)
     pairwise_dist = _pairwise_distances(embeddings, squared=squared)
 
     # For each anchor, get the hardest positive
     # First, we need to get a mask for every valid positive (they should have same label)
     mask_anchor_positive = _get_anchor_positive_triplet_mask(labels)
-    mask_anchor_positive = tf.cast(mask_anchor_positive, dtype=tf.float32)
+    mask_anchor_positive = mask_anchor_positive.type(torch.float32)
 
     # We put to 0 any element where (a, p) is not valid (valid if a != p and label(a) == label(p))
-    anchor_positive_dist = tf.multiply(mask_anchor_positive, pairwise_dist)
+    anchor_positive_dist = torch.multiply(mask_anchor_positive, pairwise_dist)
 
     # shape (batch_size, 1)
-    hardest_positive_dist = tf.reduce_max(anchor_positive_dist, axis=1, keepdims=True)
-    hard_positive_indices = tf.math.argmax(anchor_positive_dist, axis=1)
-    tf.summary.scalar("hardest_positive_dist", tf.reduce_mean(hardest_positive_dist))
+    hardest_positive_dist = torch.max(anchor_positive_dist, dim=1, keepdim=False, out=None)
+    hard_positive_indices = hardest_positive_dist.indices
+    # __ tf.summary.scalar("hardest_positive_dist", tf.reduce_mean(hardest_positive_dist)) # Need to create a global SummaryWriter / Logger
 
     # For each anchor, get the hardest negative
     # First, we need to get a mask for every valid negative (they should have different labels)
     mask_anchor_negative = _get_anchor_negative_triplet_mask(labels)
-    mask_anchor_negative = tf.cast(mask_anchor_negative, dtype=tf.float32)
+    mask_anchor_negative = mask_anchor_negative.type(torch.float32)
 
     # We add the maximum value in each row to the invalid negatives (label(a) == label(n))
-    max_anchor_negative_dist = tf.reduce_max(pairwise_dist, axis=1, keepdims=True)
+    max_anchor_negative_dist = torch.max(pairwise_dist, dim=1, keepdims=True)
     anchor_negative_dist = pairwise_dist + max_anchor_negative_dist * (1.0 - mask_anchor_negative)
 
     # shape (batch_size,)
-    hardest_negative_dist = tf.reduce_min(anchor_negative_dist, axis=1, keepdims=True)
-    hard_negative_indices = tf.math.argmin(anchor_negative_dist, axis=1)
-    tf.summary.scalar("hardest_negative_dist", tf.reduce_mean(hardest_negative_dist))
+    hardest_negative_dist = torch.min(anchor_negative_dist, axis=1, keepdims=True)
+    hard_negative_indices = hardest_negative_dist.indices
+    # __ tf.summary.scalar("hardest_negative_dist", tf.reduce_mean(hardest_negative_dist)) # Need to create a global SummaryWriter / Logger
 
     # Combine biggest d(a, p) and smallest d(a, n) into final triplet loss
     if soft:
-        triplet_loss = tf.math.log1p(tf.math.exp(hardest_positive_dist - hardest_negative_dist))
+        triplet_loss =  torch.log1p(torch.exp(hardest_positive_dist - hardest_negative_dist))
     else:
-        triplet_loss = tf.maximum(hardest_positive_dist - hardest_negative_dist + margin, 0.0)
+        triplet_loss =  torch.maximum(hardest_positive_dist - hardest_negative_dist + margin, 0.0)
     
     # Get final mean triplet loss
-    L_triplet = tf.reduce_mean(triplet_loss)
+    L_triplet = torch.mean(triplet_loss)
     
     # Embeding dict stores the mean of all embeddings of each instance
     embedding_dict = dict()
@@ -181,7 +180,7 @@ def adapted_triplet_loss(labels, embeddings, lambda_=2.0, margin=1, soft=False, 
             
     # Taking mean of the embeddings in embedding_dict
     for label in embedding_dict:
-        embedding_dict[label] = tf.math.reduce_mean(embedding_dict[label], axis=0)
+        embedding_dict[label] = torch.mean(embedding_dict[label], dim=0)
         
     # L_match_dict stores the mean of embeddings of the instances choosen in the triplet selections
     L_match_dict = dict()
@@ -202,7 +201,7 @@ def adapted_triplet_loss(labels, embeddings, lambda_=2.0, margin=1, soft=False, 
             
     # Taking mean of the embeddings in L_match_dict
     for label in L_match_dict:
-        L_match_dict[label] = tf.math.reduce_mean(L_match_dict[label], axis=0)
+        L_match_dict[label] = torch.mean(L_match_dict[label], dim=0)
         
     # Find L Match using sum of l2 norm of L_triplet - L_match_dict
     l2_norms = []
@@ -216,7 +215,7 @@ def adapted_triplet_loss(labels, embeddings, lambda_=2.0, margin=1, soft=False, 
     
     return triplet_loss
 
-class AdaptiveTripletLoss(LossFunctionWrapper):
+class AdaptiveTripletLoss(torch.nn.Module):
     """Computes the triplet loss with hard negative mining.
     The loss encourages the positive distances (between a pair of embeddings
     with the same labels) to be smaller than the minimum negative distance
@@ -248,16 +247,19 @@ class AdaptiveTripletLoss(LossFunctionWrapper):
 
     @typechecked
     def __init__(
-        self, margin: FloatTensorLike = 1.0, 
-        lambda_: FloatTensorLike = 0.3,
+        self,
+        margin: torch.FloatTensor = 1.0,
+        lambda_: torch.FloatTensor = 0.3,
         soft: bool = False,
         distance_metric: Union[str, Callable] = "L2",
         name: Optional[str] = None, **kwargs
     ):
-        super().__init__(adapted_triplet_loss,
-                         name = name, 
-                         reduction = tf.keras.losses.Reduction.NONE,
-                         margin = margin,
-                         lambda_ = lambda_,
-                         soft = soft,
-                         squared = False if distance_metric=="L2" else True)
+        super(AdaptiveTripletLoss, self).__init__(reduction='none')
+        self.name = name
+        self.margin = margin
+        self.lambda_ = lambda_
+        self.soft = soft
+        self.squared = False if distance_metric=="L2" else True
+    
+    def forward(self, labels, embeddings):
+        return adapted_triplet_loss(labels, embeddings, lambda_=self.lambda_, margin=self.margin, soft=self.soft, squared=self.squared)
