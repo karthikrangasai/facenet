@@ -14,10 +14,8 @@
 # ==============================================================================
 """Implements triplet loss."""
 
-import tensorflow as tf
-from tensorflow_addons.losses import metric_learning
-from tensorflow_addons.utils.types import FloatTensorLike, TensorLike
-from tensorflow_addons.utils.keras_utils import LossFunctionWrapper
+import torch
+import torch.nn.functional as F
 from typeguard import typechecked
 from typing import Optional, Union, Callable
 
@@ -32,10 +30,10 @@ def _masked_maximum(data, mask, dim=1):
       masked_maximums: N-D `Tensor`.
         The maximized dimension is of size 1 after the operation.
     """
-    axis_minimums = tf.math.reduce_min(data, dim, keepdims=True)
+    axis_minimums = torch.min(data, dim=dim, keepdim=True)
     masked_maximums = (
-        tf.math.reduce_max(
-            tf.math.multiply(data - axis_minimums, mask), dim, keepdims=True
+        torch.max(
+            torch.multiply(data - axis_minimums, mask), dim=dim, keepdim=True
         )
         + axis_minimums
     )
@@ -52,25 +50,23 @@ def _masked_minimum(data, mask, dim=1):
       masked_minimums: N-D `Tensor`.
         The minimized dimension is of size 1 after the operation.
     """
-    axis_maximums = tf.math.reduce_max(data, dim, keepdims=True)
+    axis_maximums = torch.max(data, dim=dim, keepdim=True)
     masked_minimums = (
-        tf.math.reduce_min(
-            tf.math.multiply(data - axis_maximums, mask), dim, keepdims=True
+        torch.min(
+            torch.multiply(data - axis_maximums, mask), dim=dim, keepdim=True
         )
         + axis_maximums
     )
     return masked_minimums
 
-
-@tf.function
 def triplet_focal_loss(
-    y_true: TensorLike,
-    y_pred: TensorLike,
-    margin: FloatTensorLike = 0.2,
-    sigma: FloatTensorLike = 0.3,
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    margin: torch.FloatTensor = 0.2,
+    sigma: torch.FloatTensor = 0.3,
     soft: bool = False,
     distance_metric: Union[str, Callable] = "L2",
-) -> tf.Tensor:
+) -> torch.Tensor:
     """Computes the triplet focal loss with hard negative and hard positive mining.
     Args:
       y_true: 1-D integer `Tensor` with shape [batch_size] of
@@ -96,79 +92,76 @@ def triplet_focal_loss(
     labels, embeddings = y_true, y_pred
 
     convert_to_float32 = (
-        embeddings.dtype == tf.dtypes.float16 or embeddings.dtype == tf.dtypes.bfloat16
+        embeddings.dtype == torch.float16 or embeddings.dtype == torch.bfloat16
     )
     precise_embeddings = (
-        tf.cast(embeddings, tf.dtypes.float32) if convert_to_float32 else embeddings
+        embeddings.type(torch.float32) if convert_to_float32 else embeddings
     )
 
     # Reshape label tensor to [batch_size, 1].
-    lshape = tf.shape(labels)
-    labels = tf.reshape(labels, [lshape[0], 1])
+    lshape = labels.shape
+    labels = torch.reshape(labels, [lshape[0], 1])
 
     # Build pairwise squared distance matrix.
     if distance_metric == "L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=False
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
 
     elif distance_metric == "squared-L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=True
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
+        pdist_matrix = torch.square(pdist_matrix)
 
     elif distance_metric == "angular":
-        pdist_matrix = metric_learning.angular_distance(precise_embeddings)
+        pdist_matrix = torch.maximum(
+            (1 - F.cosine_similarity(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])),
+            0.0
+        )
 
     else:
         pdist_matrix = distance_metric(precise_embeddings)
 
     # Build pairwise binary adjacency matrix.
-    adjacency = tf.math.equal(labels, tf.transpose(labels))
+    adjacency = torch.eq(labels, torch.transpose(labels))
     # Invert so we can select negatives only.
-    adjacency_not = tf.math.logical_not(adjacency)
+    adjacency_not = torch.logical_not(adjacency)
 
-    adjacency_not = tf.cast(adjacency_not, dtype=tf.dtypes.float32)
+    adjacency_not = adjacency_not.type(torch.float32)
     # hard negatives: smallest D_an.
     hard_negatives = _masked_minimum(pdist_matrix, adjacency_not)
 
-    batch_size = tf.size(labels)
+    batch_size = labels.size()
 
-    adjacency = tf.cast(adjacency, dtype=tf.dtypes.float32)
+    adjacency = adjacency.type(torch.float32)
 
-    mask_positives = tf.cast(adjacency, dtype=tf.dtypes.float32) - tf.linalg.diag(
-        tf.ones([batch_size])
-    )
+    mask_positives = adjacency.type(torch.float32) - torch.diag(torch.ones(batch_size))
 
     # hard positives: largest D_ap.
     hard_positives = _masked_maximum(pdist_matrix, mask_positives)
 
-    p_hard = tf.math.exp(tf.math.divide(hard_positives, sigma))
-    n_hard = tf.math.exp(tf.math.divide(hard_negatives, sigma))
+    p_hard = torch.exp(torch.divide(hard_positives, sigma))
+    n_hard = torch.exp(torch.divide(hard_negatives, sigma))
 
     if soft:
-        triplet_loss = tf.math.log1p(tf.math.exp(p_hard - n_hard))
+        triplet_loss = torch.log1p(torch.exp(p_hard - n_hard))
     else:
-        triplet_loss = tf.maximum(p_hard - n_hard + margin, 0.0)
+        triplet_loss = torch.maximum(p_hard - n_hard + margin, 0.0)
 
     # Get final mean triplet loss
-    triplet_loss = tf.reduce_mean(triplet_loss)
+    triplet_loss = torch.mean(triplet_loss)
 
     if convert_to_float32:
-        return tf.cast(triplet_loss, embeddings.dtype)
+        return triplet_loss.type(embeddings.dtype)
     else:
         return triplet_loss
 
 
 
-@tf.function
 def triplet_batch_hard_loss(
-    y_true: TensorLike,
-    y_pred: TensorLike,
-    margin: FloatTensorLike = 1.0,
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    margin: torch.FloatTensor = 1.0,
     soft: bool = False,
     distance_metric: Union[str, Callable] = "L2",
-) -> tf.Tensor:
+) -> torch.Tensor:
     """Computes the triplet loss with hard negative and hard positive mining.
     Args:
       y_true: 1-D integer `Tensor` with shape [batch_size] of
@@ -196,75 +189,72 @@ def triplet_batch_hard_loss(
     labels, embeddings = y_true, y_pred
 
     convert_to_float32 = (
-        embeddings.dtype == tf.dtypes.float16 or embeddings.dtype == tf.dtypes.bfloat16
+        embeddings.dtype == torch.float16 or embeddings.dtype == torch.bfloat16
     )
     precise_embeddings = (
-        tf.cast(embeddings, tf.dtypes.float32) if convert_to_float32 else embeddings
+        embeddings.type(torch.float32) if convert_to_float32 else embeddings
     )
 
     # Reshape label tensor to [batch_size, 1].
-    lshape = tf.shape(labels)
-    labels = tf.reshape(labels, [lshape[0], 1])
+    lshape = labels.shape
+    labels = torch.reshape(labels, [lshape[0], 1])
 
     # Build pairwise squared distance matrix.
     if distance_metric == "L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=False
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
 
     elif distance_metric == "squared-L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=True
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
+        pdist_matrix = torch.square(pdist_matrix)
 
     elif distance_metric == "angular":
-        pdist_matrix = metric_learning.angular_distance(precise_embeddings)
+        pdist_matrix = torch.maximum(
+            (1 - F.cosine_similarity(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])),
+            0.0
+        )
 
     else:
         pdist_matrix = distance_metric(precise_embeddings)
 
     # Build pairwise binary adjacency matrix.
-    adjacency = tf.math.equal(labels, tf.transpose(labels))
+    adjacency = torch.eq(labels, torch.transpose(labels))
     # Invert so we can select negatives only.
-    adjacency_not = tf.math.logical_not(adjacency)
+    adjacency_not = torch.logical_not(adjacency)
 
-    adjacency_not = tf.cast(adjacency_not, dtype=tf.dtypes.float32)
+    adjacency_not = adjacency_not.type(torch.float32)
     # hard negatives: smallest D_an.
     hard_negatives = _masked_minimum(pdist_matrix, adjacency_not)
 
-    batch_size = tf.size(labels)
+    batch_size = labels.size()
 
-    adjacency = tf.cast(adjacency, dtype=tf.dtypes.float32)
+    adjacency = adjacency.type(torch.float32)
 
-    mask_positives = tf.cast(adjacency, dtype=tf.dtypes.float32) - tf.linalg.diag(
-        tf.ones([batch_size])
-    )
+    mask_positives = adjacency.type(torch.float32) - torch.diag(torch.ones(batch_size))
 
     # hard positives: largest D_ap.
     hard_positives = _masked_maximum(pdist_matrix, mask_positives)
 
     if soft:
-        triplet_loss = tf.math.log1p(tf.math.exp(hard_positives - hard_negatives))
+        triplet_loss = torch.log1p(torch.exp(hard_positives - hard_negatives))
     else:
-        triplet_loss = tf.maximum(hard_positives - hard_negatives + margin, 0.0)
+        triplet_loss = torch.maximum(hard_positives - hard_negatives + margin, 0.0)
 
     # Get final mean triplet loss
-    triplet_loss = tf.reduce_mean(triplet_loss)
+    triplet_loss = torch.mean(triplet_loss)
 
     if convert_to_float32:
-        return tf.cast(triplet_loss, embeddings.dtype)
+        return triplet_loss.type(embeddings.dtype)
     else:
         return triplet_loss
 
-@tf.function
 def assorted_triplet_loss(
-    y_true: TensorLike,
-    y_pred: TensorLike,
-    margin: FloatTensorLike = 1.0,
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    margin: torch.FloatTensor = 1.0,
     focal: bool = False,
-    sigma: FloatTensorLike = 0.3,
+    sigma: torch.FloatTensor = 0.3,
     distance_metric: Union[str, Callable] = "L2",
-) -> tf.Tensor:
+) -> torch.Tensor:
     """Computes assorted triplet loss with hard negative and hard positive mining.
     See https://arxiv.org/pdf/2007.02200.pdf
     Args:
@@ -293,84 +283,81 @@ def assorted_triplet_loss(
     labels, embeddings = y_true, y_pred
 
     convert_to_float32 = (
-        embeddings.dtype == tf.dtypes.float16 or embeddings.dtype == tf.dtypes.bfloat16
+        embeddings.dtype == torch.float16 or embeddings.dtype == torch.bfloat16
     )
     precise_embeddings = (
-        tf.cast(embeddings, tf.dtypes.float32) if convert_to_float32 else embeddings
+        embeddings.type(torch.float32) if convert_to_float32 else embeddings
     )
 
     # Reshape label tensor to [batch_size, 1].
-    lshape = tf.shape(labels)
-    labels = tf.reshape(labels, [lshape[0], 1])
+    lshape = labels.shape
+    labels = torch.reshape(labels, [lshape[0], 1])
 
     # Build pairwise squared distance matrix.
     if distance_metric == "L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=False
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
 
     elif distance_metric == "squared-L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=True
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
+        pdist_matrix = torch.square(pdist_matrix)
 
     elif distance_metric == "angular":
-        pdist_matrix = metric_learning.angular_distance(precise_embeddings)
+        pdist_matrix = torch.maximum(
+            (1 - F.cosine_similarity(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])),
+            0.0
+        )
 
     else:
         pdist_matrix = distance_metric(precise_embeddings)
 
     # Build pairwise binary adjacency matrix.
-    adjacency = tf.math.equal(labels, tf.transpose(labels))
+    adjacency = torch.eq(labels, torch.transpose(labels))
     # Invert so we can select negatives only.
-    adjacency_not = tf.math.logical_not(adjacency)
+    adjacency_not = torch.logical_not(adjacency)
 
-    adjacency_not = tf.cast(adjacency_not, dtype=tf.dtypes.float32)
+    adjacency_not = adjacency_not.type(torch.float32)
     # hard negatives: smallest D_an.
-    r = tf.random.uniform(shape=[], minval=0, maxval=1)
+    r = torch.FloatTensor(1).uniform_(0,1)
     if r < 0.5:
         hard_negatives = _masked_minimum(pdist_matrix, adjacency_not)
     else:
         hard_negatives = _masked_maximum(pdist_matrix, adjacency_not)
 
-    batch_size = tf.size(labels)
+    batch_size = labels.size()
 
-    adjacency = tf.cast(adjacency, dtype=tf.dtypes.float32)
+    adjacency = adjacency.type(torch.float32)
 
-    mask_positives = tf.cast(adjacency, dtype=tf.dtypes.float32) - tf.linalg.diag(
-        tf.ones([batch_size])
-    )
+    mask_positives = adjacency.type(torch.float32) - torch.diag(torch.ones(batch_size))
 
     # hard positives: largest D_ap.
-    s = tf.random.uniform(shape=[], minval=0, maxval=1)
+    s = torch.FloatTensor(1).uniform_(0,1)
     if s < 0.5:
         hard_positives = _masked_minimum(pdist_matrix, mask_positives)
     else:
         hard_positives = _masked_maximum(pdist_matrix, mask_positives)
     
     if focal:
-        hard_positives = tf.math.exp(tf.math.divide(hard_positives, sigma))
-        hard_negatives = tf.math.exp(tf.math.divide(hard_negatives, sigma))
+        hard_positives = torch.exp(torch.divide(hard_positives, sigma))
+        hard_negatives = torch.exp(torch.divide(hard_negatives, sigma))
 
-    triplet_loss = tf.maximum(hard_positives - hard_negatives + margin, 0.0)
+    triplet_loss = torch.maximum(hard_positives - hard_negatives + margin, 0.0)
 
     # Get final mean triplet loss
-    triplet_loss = tf.reduce_mean(triplet_loss)
+    triplet_loss = torch.mean(triplet_loss)
 
     if convert_to_float32:
-        return tf.cast(triplet_loss, embeddings.dtype)
+        return triplet_loss.type(embeddings.dtype)
     else:
         return triplet_loss
 
-@tf.function
 def triplet_batch_hard_v2_loss(
-    y_true: TensorLike,
-    y_pred: TensorLike,
-    margin1: FloatTensorLike = -1.0,
-    margin2: FloatTensorLike = 0.01,
-    beta: FloatTensorLike = 0.002,
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    margin1: torch.FloatTensor = -1.0,
+    margin2: torch.FloatTensor = 0.01,
+    beta: torch.FloatTensor = 0.002,
     distance_metric: Union[str, Callable] = "L2",
-) -> tf.Tensor:
+) -> torch.Tensor:
     """Computes the triplet loss with hard negative and hard positive mining.
     Args:
       y_true: 1-D integer `Tensor` with shape [batch_size] of
@@ -399,66 +386,64 @@ def triplet_batch_hard_v2_loss(
     labels, embeddings = y_true, y_pred
 
     convert_to_float32 = (
-        embeddings.dtype == tf.dtypes.float16 or embeddings.dtype == tf.dtypes.bfloat16
+        embeddings.dtype == torch.float16 or embeddings.dtype == torch.bfloat16
     )
     precise_embeddings = (
-        tf.cast(embeddings, tf.dtypes.float32) if convert_to_float32 else embeddings
+        embeddings.type(torch.float32) if convert_to_float32 else embeddings
     )
 
     # Reshape label tensor to [batch_size, 1].
-    lshape = tf.shape(labels)
-    labels = tf.reshape(labels, [lshape[0], 1])
+    lshape = labels.shape
+    labels = torch.reshape(labels, [lshape[0], 1])
 
     # Build pairwise squared distance matrix.
     if distance_metric == "L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=False
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
 
     elif distance_metric == "squared-L2":
-        pdist_matrix = metric_learning.pairwise_distance(
-            precise_embeddings, squared=True
-        )
+        pdist_matrix = F.pairwise_distance(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])
+        pdist_matrix = torch.square(pdist_matrix)
 
     elif distance_metric == "angular":
-        pdist_matrix = metric_learning.angular_distance(precise_embeddings)
+        pdist_matrix = torch.maximum(
+            (1 - F.cosine_similarity(precise_embeddings[:,:,None], precise_embeddings.transpose()[None,:,:])),
+            0.0
+        )
 
     else:
         pdist_matrix = distance_metric(precise_embeddings)
 
     # Build pairwise binary adjacency matrix.
-    adjacency = tf.math.equal(labels, tf.transpose(labels))
+    adjacency = torch.eq(labels, torch.transpose(labels))
     # Invert so we can select negatives only.
-    adjacency_not = tf.math.logical_not(adjacency)
+    adjacency_not = torch.logical_not(adjacency)
 
-    adjacency_not = tf.cast(adjacency_not, dtype=tf.dtypes.float32)
+    adjacency_not = adjacency_not.type(torch.float32)
     # hard negatives: smallest D_an.
     hard_negatives = _masked_minimum(pdist_matrix, adjacency_not)
 
-    batch_size = tf.size(labels)
+    batch_size = labels.size()
 
-    adjacency = tf.cast(adjacency, dtype=tf.dtypes.float32)
+    adjacency = adjacency.type(torch.float32)
 
-    mask_positives = tf.cast(adjacency, dtype=tf.dtypes.float32) - tf.linalg.diag(
-        tf.ones([batch_size])
-    )
+    mask_positives = adjacency.type(torch.float32) - torch.diag(torch.ones(batch_size))
 
     # hard positives: largest D_ap.
     hard_positives = _masked_maximum(pdist_matrix, mask_positives)
 
-    triplet_loss = tf.maximum(hard_positives - hard_negatives, margin1) + tf.math.multiply(
-                                              tf.maximum(hard_positives, margin2), beta)
+    triplet_loss = torch.maximum(hard_positives - hard_negatives, margin1) + torch.multiply(
+                                              torch.maximum(hard_positives, margin2), beta)
 
     # Get final mean triplet loss
-    triplet_loss = tf.reduce_mean(triplet_loss)
+    triplet_loss = torch.mean(triplet_loss)
 
     if convert_to_float32:
-        return tf.cast(triplet_loss, embeddings.dtype)
+        return triplet_loss.type(embeddings.dtype)
     else:
         return triplet_loss
 
 
-class TripletFocalLoss(LossFunctionWrapper):
+class TripletFocalLoss(torch.nn.Module):
     """Computes the triplet loss with hard negative mining.
     The loss encourages the positive distances (between a pair of embeddings
     with the same labels) to be smaller than the minimum negative distance
@@ -490,22 +475,25 @@ class TripletFocalLoss(LossFunctionWrapper):
 
     @typechecked
     def __init__(
-        self, margin: FloatTensorLike = 1.0, 
-        sigma: FloatTensorLike = 0.3,
+        self, 
+        margin: torch.FloatTensor = 1.0, 
+        sigma: torch.FloatTensor = 0.3,
         soft: bool = False,
         distance_metric: Union[str, Callable] = "L2",
         name: Optional[str] = None, **kwargs
     ):
-        super().__init__(triplet_focal_loss,
-                         name = name, 
-                         reduction = tf.keras.losses.Reduction.NONE,
-                         margin = margin,
-                         sigma = sigma,
-                         soft = soft,
-                         distance_metric = distance_metric)
+        super(TripletFocalLoss, self).__init__(reduction='none')
+        self.margin = margin
+        self.sigma = sigma
+        self.soft = soft
+        self.distance_metric = distance_metric
+        self.name = name
+    
+    def forward(self, y_true, y_pred):
+        return triplet_focal_loss(y_true, y_pred, margin=self.margin, sigma=self.sigma, soft=self.soft, distance_metric=self.distance_metric)
 
 
-class TripletBatchHardLoss(LossFunctionWrapper):
+class TripletBatchHardLoss(torch.nn.Module):
     """Computes the triplet loss with hard negative and hard positive mining.
     The loss encourages the maximum positive distance (between a pair of embeddings
     with the same labels) to be smaller than the minimum negative distance plus the
@@ -538,21 +526,23 @@ class TripletBatchHardLoss(LossFunctionWrapper):
     @typechecked
     def __init__(
         self,
-        margin: FloatTensorLike = 1.0,
+        margin: torch.FloatTensor = 1.0,
         soft: bool = False,
         distance_metric: Union[str, Callable] = "L2",
         name: Optional[str] = None,
         **kwargs
     ):
-        super().__init__(triplet_batch_hard_loss,
-                         name = name, 
-                         reduction = tf.keras.losses.Reduction.NONE,
-                         margin = margin,
-                         soft = soft,
-                         distance_metric = distance_metric)
+        super(TripletBatchHardLoss, self).__init__(reduction='none')
+        self.name = name
+        self.margin = margin
+        self.soft = soft
+        self.distance_metric = distance_metric
+    
+    def forward(self, y_true, y_pred):
+        return triplet_batch_hard_loss(y_true, y_pred, margin=self.margin, soft=self.soft, distance_metric=self.distance_metric)
 
 
-class TripletBatchHardV2Loss(LossFunctionWrapper):
+class TripletBatchHardV2Loss(torch.nn.Module):
     """Computes the triplet loss with hard negative and hard positive mining.
     The loss encourages the maximum positive distance (between a pair of embeddings
     with the same labels) to be smaller than the minimum negative distance plus the
@@ -586,23 +576,25 @@ class TripletBatchHardV2Loss(LossFunctionWrapper):
     @typechecked
     def __init__(
         self,
-        margin1: FloatTensorLike = -1.0,
-        margin2: FloatTensorLike = 0.01,
-        beta: FloatTensorLike = 0.002,
+        margin1: torch.FloatTensor = -1.0,
+        margin2: torch.FloatTensor = 0.01,
+        beta: torch.FloatTensor = 0.002,
         distance_metric: Union[str, Callable] = "L2",
         name: Optional[str] = None,
         **kwargs
     ):
-        super().__init__(triplet_batch_hard_v2_loss,
-                         name = name, 
-                         reduction = tf.keras.losses.Reduction.NONE,
-                         margin1 = margin1,
-                         margin2 = margin2,
-                         beta = beta,
-                         distance_metric = distance_metric)
+        super(TripletBatchHardV2Loss, self).__init__(reduction='none')
+        self.name = name
+        self.margin1 = margin1
+        self.margin2 = margin2
+        self.beta = beta
+        self.distance_metric = distance_metric
+    
+    def forward(self, y_true, y_pred):
+        return triplet_batch_hard_v2_loss(y_true, y_pred, margin1=self.margin1, margin2=self.margin2, beta=self.beta, distance_metric=self.distance_metric)
 
 
-class AssortedTripletLoss(LossFunctionWrapper):
+class AssortedTripletLoss(torch.nn.Module):
     """Computes assorted triplet loss with hard negative and hard positive mining.
     See https://arxiv.org/pdf/2007.02200.pdf
     The loss encourages the positive distances (between a pair of embeddings
@@ -641,16 +633,18 @@ class AssortedTripletLoss(LossFunctionWrapper):
 
     @typechecked
     def __init__(
-        self, margin: FloatTensorLike = 1.0, 
-        sigma: FloatTensorLike = 0.3,
+        self, margin: torch.FloatTensor = 1.0, 
+        sigma: torch.FloatTensor = 0.3,
         focal: bool = False,
         distance_metric: Union[str, Callable] = "L2",
         name: Optional[str] = None, **kwargs
     ):
-        super().__init__(assorted_triplet_loss,
-                         name = name, 
-                         reduction = tf.keras.losses.Reduction.NONE,
-                         margin = margin,
-                         sigma = sigma,
-                         focal = focal,
-                         distance_metric = distance_metric)
+        super(AssortedTripletLoss, self).__init__(reduction='none')
+        self.name = name
+        self.margin = margin
+        self.sigma = sigma
+        self.focal = focal
+        self.distance_metric = distance_metric
+    
+    def forward(self, y_true, y_pred):
+        return assorted_triplet_loss(y_true, y_pred, margin=self.margin, focal=self.focal, sigma=self.sigma, distance_metric=self.distance_metric)
