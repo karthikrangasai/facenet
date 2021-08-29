@@ -5,9 +5,11 @@ is calculated and plotted.
 import os
 import sys
 import math
+import pathlib
 import argparse
 import importlib
 import numpy as np
+from tqdm import tqdm
 from scipy import misc
 import tensorflow as tf
 from sklearn import metrics
@@ -52,28 +54,28 @@ def _read_pairs(pairs_filename, lfw_path):
 def _get_preprocessor(model_type):
     if 'inception_resnet_v2' in model_type:
         preprocessor = 'tensorflow.keras.applications.inception_resnet_v2'
-        print('[INFO] Loaded Inception-Resnet-V2 data preprocessor', flush=True)
+        #print('[INFO] Loaded Inception-Resnet-V2 data preprocessor', flush=True)
     elif 'efficientnet' in model_type:
         preprocessor = 'tensorflow.keras.applications.efficientnet'
-        print('[INFO] Loaded EfficientNet data preprocessor', flush=True)
+        #print('[INFO] Loaded EfficientNet data preprocessor', flush=True)
     elif 'xception' in model_type:
         preprocessor = 'tensorflow.keras.applications.xception'
-        print('[INFO] Loaded Xception data preprocessor', flush=True)
+        #print('[INFO] Loaded Xception data preprocessor', flush=True)
     elif 'inception_v3' in model_type:
         preprocessor = 'tensorflow.keras.applications.inception_v3'
-        print('[INFO] Loaded Inception-V3 data preprocessor', flush=True)
+        #print('[INFO] Loaded Inception-V3 data preprocessor', flush=True)
     elif 'resnet' in model_type:
         preprocessor = 'tensorflow.keras.applications.resnet'
-        print('[INFO] Loaded Resnet data preprocessor', flush=True)
+        #print('[INFO] Loaded Resnet data preprocessor', flush=True)
     elif 'mobilenet_v2' in model_type:
         preprocessor = 'tensorflow.keras.applications.mobilenet_v2'
-        print('[INFO] Loaded MobileNet-V2 data preprocessor', flush=True)
+        #print('[INFO] Loaded MobileNet-V2 data preprocessor', flush=True)
     elif 'mobilenet' in model_type:
         preprocessor = 'tensorflow.keras.applications.mobilenet'
-        print('[INFO] Loaded MobileNet data preprocessor', flush=True)
+        #print('[INFO] Loaded MobileNet data preprocessor', flush=True)
     else:
         preprocessor = None
-        print('[WARNING] Could not find appropriate pre-processor for model', flush=True)
+        #print('[WARNING] Could not find appropriate pre-processor for model', flush=True)
 
     if preprocessor is not None:
         preprocessor = importlib.import_module(preprocessor)
@@ -245,7 +247,7 @@ def main(weights_path, lfw_path, image_size, crop_size, model_type, loss_type,
     embeddings = np.zeros((nrof_pairs*2, embedding_size))
 
     if load_from_file is None or load_from_file is False:
-        for pair_num, pair in enumerate(pairs):
+        for pair_num, pair in enumerate(tqdm(pairs, file=sys.stdout)):
             temp_emb = None
             x_ds, ic = get_dataset(data_path=os.path.join(lfw_path, pair[2]), 
                                    image_size=image_size,
@@ -265,7 +267,7 @@ def main(weights_path, lfw_path, image_size, crop_size, model_type, loss_type,
 
             assert temp_emb.shape == (ic, embedding_size)
             
-            mean_emb = np.squeeze(np.mean(temp_emb, axis=1))
+            mean_emb = np.squeeze(np.mean(temp_emb, axis=0))
             #assert mean_emb.shape[1] == embedding_size
             embeddings[2*pair_num] = mean_emb
 
@@ -288,7 +290,7 @@ def main(weights_path, lfw_path, image_size, crop_size, model_type, loss_type,
 
             assert temp_emb.shape == (ic, embedding_size)
             
-            mean_emb = np.squeeze(np.mean(temp_emb, axis=1))
+            mean_emb = np.squeeze(np.mean(temp_emb, axis=0))
             #assert mean_emb.shape[1] == embedding_size
             embeddings[(2*pair_num) + 1] = mean_emb
 

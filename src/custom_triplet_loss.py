@@ -648,3 +648,97 @@ class AssortedTripletLoss(torch.nn.Module):
     
     def forward(self, y_true, y_pred):
         return assorted_triplet_loss(y_true, y_pred, margin=self.margin, focal=self.focal, sigma=self.sigma, distance_metric=self.distance_metric)
+
+class ConstellationLoss(torch.nn.Module):
+    '''Computes constellation loss.
+    See https://arxiv.org/pdf/1905.10675.pdf for more details.
+    Note that the batch is divided into groups of k, so the effective batch size
+    for training should be batch_size * k. To make things simpler, we perform an
+    internal divison of batch size by k to prevent issues.
+    '''
+    def __init__(self, k: int = 4, batch_size: int = 128, 
+                 name: str = 'ConstellationLoss'):
+        super(ConstellationLoss, self).__init__(reduction='none')
+        self.k = k
+        self.BATCH_SIZE = batch_size // k
+
+    def _get_triplet_mask(self, labels: torch.Tensor):
+        """Return a 3D mask where mask[a, p, n] is True iff the triplet (a, p, n) is valid.
+        A triplet (i, j, k) is valid if:
+            - i, j, k are distinct
+            - labels[i] == labels[j] and labels[i] != labels[k]
+        Args:
+            labels: tf.int32 `Tensor` with shape [batch_size]
+        """
+
+        # Check that i, j and k are distinct
+        indices_equal = torch.eye(labels.size()[0]).to(dtype=torch.bool)
+        indices_not_equal = torch.logical_not(indices_equal)
+        i_not_equal_j = indices_not_equal.unsqueeze(2)
+        i_not_equal_k = indices_not_equal.unsqueeze(1)
+        j_not_equal_k = indices_not_equal.unsqueeze(0)
+
+        distinct_indices = torch.logical_and(torch.logical_and(i_not_equal_j, i_not_equal_k), j_not_equal_k)
+
+
+        # Check if labels[i] == labels[j] and labels[i] != labels[k]
+        label_equal = torch.eq(labels.unsqueeze(0), labels.unsqueeze(1))
+        i_equal_j = label_equal.unsqueeze(2)
+        i_equal_k = label_equal.unsqueeze(1)
+
+        valid_labels = torch.logical_and(i_equal_j, torch.logical_not(i_equal_k))
+
+        # Combine the two masks
+        mask = torch.logical_and(distinct_indices, valid_labels)
+
+        return mask
+
+    def forward(self, labels, embeddings):
+        """Build the constellation loss over a batch of embeddings.
+                Args:
+                    labels: labels of the batch, of size (batch_size,)
+                    embeddings: tensor of shape (batch_size, embed_dim)
+
+                Returns:
+                    ctl_loss: scalar tensor containing the constellation loss
+
+                @TODO: Try to optimize the code wherever possible to speed up performance
+                """
+
+        labels_list = []
+        embeddings_list = []
+        for i in range(self.k):
+            labels_list.append(labels[self.BATCH_SIZE * i:self.BATCH_SIZE * (i + 1)])
+            embeddings_list.append(embeddings[self.BATCH_SIZE * i:self.BATCH_SIZE * (i + 1)])
+
+        loss_list = []
+        for i in range(len(embeddings_list)):
+            # Get the dot product
+            pairwise_dist = torch.matmul(embeddings_list[i], torch.transpose(embeddings_list[i]))
+
+            # shape (batch_size, batch_size, 1)
+            anchor_positive_dist = pairwise_dist.unsqueeze(2)
+            assert anchor_positive_dist.size()[2] == 1, "{}".format(anchor_positive_dist.size())
+            # shape (batch_size, 1, batch_size)
+            anchor_negative_dist = pairwise_dist.unsqueeze(1)
+            assert anchor_negative_dist.size()[1] == 1, "{}".format(anchor_negative_dist.size())
+
+            ctl_loss = anchor_negative_dist - anchor_positive_dist
+
+            # (where label(a) != label(p) or label(n) == label(a) or a == p)
+            mask = self._get_triplet_mask(labels_list[i])
+            mask = mask.to(dtype=torch.float32)
+            ctl_loss = torch.multiply(mask, ctl_loss)
+
+            loss_list.append(ctl_loss)
+
+        ctl_loss = 1. + torch.exp(loss_list[0])
+        for i in range(1, len(embeddings_list)):
+            ctl_loss += torch.exp(loss_list[i])
+
+        ctl_loss = torch.log(ctl_loss)
+
+        # # Get final mean constellation loss and divide due to very large loss value
+        ctl_loss = ctl_loss.sum() / 1000.
+
+        return ctl_loss

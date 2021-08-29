@@ -2,6 +2,7 @@ import os
 import tensorflow as tf
 import tensorflow_addons as tfa
 from tensorflow.keras.models import Model
+from models.efficientnetv2 import effnetv2_model
 from tensorflow.keras.layers import Input, Dense, Dropout
 from tensorflow.keras.applications.resnet import *
 from adaptive_triplet_loss import AdaptiveTripletLoss
@@ -12,7 +13,7 @@ from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2
 from tensorflow.keras.applications.inception_v3 import InceptionV3
 from tensorflow.keras.applications.inception_resnet_v2 import InceptionResNetV2
 from tensorflow.keras.mixed_precision import experimental as mixed_precision
-from custom_triplet_loss import TripletBatchHardLoss, TripletFocalLoss, TripletBatchHardV2Loss, AssortedTripletLoss
+from custom_triplet_loss import TripletBatchHardLoss, TripletFocalLoss, TripletBatchHardV2Loss, AssortedTripletLoss, ConstellationLoss
 
 
 def Backbone(model_type='resnet50', use_imagenet=True):
@@ -101,18 +102,37 @@ def create_neural_network_v2(model_type='resnet50', embedding_size=512, input_sh
         It makes things more fun to read.
 
         And then the Lord spake, saying:
-        "First, shalt thou take out the model's top layer. Then shalt thou count to three.
-        No more, no less. Then shalt thou count to three, no more, no less. Three shall be the
-        number thou shalt count, and the number of the counting shall be three. Four shalt thou 
-        not count, neither count thou two, excepting that thou then proceed to three. Five is 
-        right out. Once the number three, being the third number, be reached, then createst thou 
-        thy input layer, which having a 3-dimensional shape, shall serve you well."
+        "First, shalt thou take out the model's top layer. Then shalt thou count to three, 
+        no more, no less. Three shall be the number thou shalt count, and the number of the 
+        counting shall be three. Four shalt thou not count, neither count thou two, excepting 
+        that thou then proceed to three. Five is right out. Once the number three, being the 
+        third number, be reached, then createst thou thy input layer, which having a 3-dimensional 
+        shape, shall serve you well."
     '''
-    inputs = Input(input_shape, name='image_input')
-    backbone = Backbone(model_type=model_type, use_imagenet=use_imagenet)(inputs)
-    embeddings = OutputLayer(embedding_size=embedding_size, model_type=model_type)(backbone)
+    model = None
+    if 'efficientnetv2' in model_type:
+        if use_imagenet is True:
+            weights = 'imagenet21k-ft1k'
+            #weights = 'imagenet21k'
+            #weights = 'imagenet'
+        else:
+            weights = None
+
+        model = tf.keras.models.Sequential([
+                    tf.keras.layers.InputLayer(input_shape=input_shape),
+                    effnetv2_model.get_model(model_type, include_top=False, weights=weights, input_size=input_shape[0]),
+                    tf.keras.layers.Dropout(rate=0.3),
+                    tf.keras.layers.Dense(embedding_size, activation=None, name='logits'),
+                    tf.keras.layers.Lambda(lambda k: tf.math.l2_normalize(k, axis=1), dtype='float32',
+                                           name='embeddings')
+                ])
+    else:
+        inputs = Input(input_shape, name='image_input')
+        backbone = Backbone(model_type=model_type, use_imagenet=use_imagenet)(inputs)
+        embeddings = OutputLayer(embedding_size=embedding_size, model_type=model_type)(backbone)
+        model = Model(inputs=inputs, outputs=embeddings)
     
-    model = Model(inputs=inputs, outputs=embeddings)
+    assert model is not None, '[ERROR] Could not create model!'
     model.summary()
     compiled = False
 
@@ -131,6 +151,8 @@ def create_neural_network_v2(model_type='resnet50', embedding_size=512, input_sh
                     loss_obj = ['TripletBatchHardV2Loss', TripletBatchHardV2Loss]
                 elif loss_type == 'ASSORTED':
                     loss_obj = ['AssortedTripletLoss', AssortedTripletLoss]
+                elif loss_type == 'CONSTELLATION':
+                    loss_obj = ['ConstellationLoss', ConstellationLoss]
                 else:
                     loss_obj = None
                 if loss_obj is not None:
@@ -150,6 +172,8 @@ def create_neural_network_v2(model_type='resnet50', embedding_size=512, input_sh
                     loss_obj = ['TripletBatchHardV2Loss', loss_fn]
                 elif loss_type == 'ASSORTED':
                     loss_obj = ['AssortedTripletLoss', loss_fn]
+                elif loss_type == 'CONSTELLATION':
+                    loss_obj = ['ConstellationLoss', ConstellationLoss]
                 else:
                     loss_obj = None
                 if loss_obj is not None:

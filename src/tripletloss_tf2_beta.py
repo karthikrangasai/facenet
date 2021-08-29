@@ -18,7 +18,7 @@ from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2
 from tensorflow.keras.applications.inception_v3 import InceptionV3
 from tensorflow.keras.applications.inception_resnet_v2 import InceptionResNetV2
 from tensorflow.keras.mixed_precision import experimental as mixed_precision
-from custom_triplet_loss import TripletBatchHardLoss, TripletFocalLoss, TripletBatchHardV2Loss, AssortedTripletLoss
+from custom_triplet_loss import TripletBatchHardLoss, TripletFocalLoss, TripletBatchHardV2Loss, AssortedTripletLoss, ConstellationLoss
 from dataset_utils import generate_training_dataset, get_test_dataset, get_LFW_dataset
 from triplet_callbacks_and_metrics import RangeTestCallback, DecayMarginCallback, TripletLossMetrics, ToggleMetricEval
 from model_utils import create_neural_network_v2
@@ -99,6 +99,8 @@ def create_neural_network(model_type='resnet50', embedding_size=512, input_shape
                     loss_obj = ['TripletBatchHardV2Loss', TripletBatchHardV2Loss]
                 elif loss_type == 'ASSORTED':
                     loss_obj = ['AssortedTripletLoss', AssortedTripletLoss]
+                elif loss_type == 'CONSTELLATION':
+                    loss_obj = ['ConstellationLoss', ConstellationLoss]
                 else:
                     loss_obj = None
                 if loss_obj is not None:
@@ -118,6 +120,8 @@ def create_neural_network(model_type='resnet50', embedding_size=512, input_shape
                     loss_obj = ['TripletBatchHardV2Loss', loss_fn]
                 elif loss_type == 'ASSORTED':
                     loss_obj = ['AssortedTripletLoss', loss_fn]
+                elif loss_type == 'CONSTELLATION':
+                    loss_obj = ['ConstellationLoss', ConstellationLoss]
                 else:
                     loss_obj = None
                 if loss_obj is not None:
@@ -169,14 +173,14 @@ def get_learning_rate_schedule(schedule_name, image_count, batch_size, learning_
                                                             staircase=True)
     elif schedule_name == 'constant':
         lr = learning_rate
-    elif schedule_name == 'cosine_restart':
+    else:
+        pass
+    '''elif schedule_name == 'cosine_restart':
         lr = tf.keras.optimizers.schedules.CosineDecayRestarts(initial_learning_rate=max_lr,
                                                                first_decay_steps=step_size,
                                                                t_mul=1.0, # Can be 2.0 as well, but 1.0 works just fine
                                                                m_mul=0.90, # Decay the starting lr for each restart
-                                                               alpha=learning_rate)
-    else:
-        pass
+                                                               alpha=learning_rate)'''
 
     assert lr is not None, '[ERROR] The learning rate schedule is not specified correctly'
 
@@ -335,6 +339,9 @@ def train_model(data_path, batch_size, image_size, crop_size, lr_schedule_name, 
                                       sigma=sigma,
                                       distance_metric=distance_metric)
         print('[INFO] Using assorted triplet loss')
+    elif triplet_strategy == 'CONSTELLATION':
+        loss_fn = ConstellationLoss(k=int(margin) if margin > 1 else 4,
+                                    batch_size=batch_size)
     else:
         loss_fn = TripletFocalLoss(margin=margin,
                                    sigma=sigma,
@@ -555,7 +562,9 @@ if __name__ == '__main__':
                         choices=['resnet50', 'resnet101', 'resnet152', 'inception_v3', 'efficientnet_b0',
                                  'efficientnet_b1', 'efficientnet_b2', 'efficientnet_b3', 'efficientnet_b4', 
                                  'efficientnet_b5', 'efficientnet_b6', 'efficientnet_b7', 'inception_resnet_v2',
-                                 'xception', 'mobilenet', 'mobilenet_v2'],
+                                 'xception', 'mobilenet', 'mobilenet_v2', 'efficientnetv2-s', 'efficientnetv2-m',
+                                 'efficientnetv2-l', 'efficientnetv2-xl', 'efficientnetv2-b0', 'efficientnetv2-b1',
+                                 'efficientnetv2-b2', 'efficientnetv2-b3'],
                         help='NN architecture to use. Default is InceptionV3')
     parser.add_argument('--embedding_size', required=False, type=int, default=512,
                         help='Embedding size for triplet loss')
@@ -564,7 +573,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', required=False, type=int, default=100,
                         help='Number of epochs to train for')
     parser.add_argument('--margin', required=False, type=float, default=0.2,
-                        help='Margin to use for triplet semi-hard loss')
+                        help='Margin to use for triplet loss. Specifies k for ConstellationLoss if margin > 1, but must be an int in this case')
     parser.add_argument('--checkpoint_path', required=False, type=str, default='./checkpoints',
                         help='Path to folder in which checkpoints are to be saved')
     parser.add_argument('--range_test', action='store_true',
@@ -578,7 +587,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_mixed_precision', action='store_true',
                         help='Use mixed precision for training. Can greatly reduce memory consumption')
     parser.add_argument('--triplet_strategy', type=str, default='FOCAL',
-                        choices=['VANILLA', 'BATCH_HARD', 'BATCH_HARD_V2', 'FOCAL', 'ADAPTIVE', 'ASSORTED'],
+                        choices=['VANILLA', 'BATCH_HARD', 'BATCH_HARD_V2', 'FOCAL', 'ADAPTIVE', 'ASSORTED', 'CONSTELLATION'],
                         help='Choice of triplet loss formulation. Default is FOCAL')
     parser.add_argument('--images_per_person', required=False, type=int, default=35,
                         help='Average number of images per class. Default is 35 (from MS1M cleaned + AsianCeleb)')
@@ -616,7 +625,7 @@ if __name__ == '__main__':
     parser.add_argument('--equisample', action='store_true',
                         help='Determines whether to sample images from each class equally to form a batch. Will have performance drawbacks if enabled')
     parser.add_argument('--loss_to_load', type=str, default='FOCAL',
-                        choices=['VANILLA', 'BATCH_HARD', 'BATCH_HARD_V2', 'FOCAL', 'ADAPTIVE', 'ASSORTED'],
+                        choices=['VANILLA', 'BATCH_HARD', 'BATCH_HARD_V2', 'FOCAL', 'ADAPTIVE', 'ASSORTED', 'CONSTELLATION'],
                         help='Choice of triplet loss object for loading models. Default is FOCAL')
     parser.add_argument('--use_imagenet', action='store_true',
                         help='Use pre-trained ImageNet weights')
